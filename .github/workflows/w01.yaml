@@ -1,16 +1,8 @@
-name: Cleanup Untagged Org Images
+name: Cleanup All Untagged Images
 
 on:
   workflow_dispatch:
     inputs:
-      organization:
-        description: 'The GitHub Organization name'
-        required: true
-        type: string
-      package_names:
-        description: 'Space-separated list of package names to clean (e.g., backend-api frontend-app)'
-        required: true
-        type: string
       days_old:
         description: 'Delete images older than (days)'
         required: true
@@ -26,69 +18,75 @@ jobs:
   cleanup:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      packages: read # Basic scope, but we use the PAT for org-wide access
+      packages: write # Required to delete packages using GITHUB_TOKEN
 
     steps:
-      - name: Validate and Setup
-        run: |
-          if [ -z "${{ secrets.ORG_PACKAGE_TOKEN }}" ]; then
-            echo "::error::Secret ORG_PACKAGE_TOKEN is missing. Please add a PAT with delete:packages scope."
-            exit 1
-          fi
-
-      - name: Process Images
+      - name: Clean Images
         env:
-          GH_TOKEN: ${{ secrets.ORG_PACKAGE_TOKEN }}
-          ORG: ${{ inputs.organization }}
-          PACKAGES: ${{ inputs.package_names }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Automatically used by gh cli
           DAYS: ${{ inputs.days_old }}
           DRY_RUN: ${{ inputs.dry_run }}
+          OWNER: ${{ github.repository_owner }}
         run: |
-          echo "## 🧹 Cleanup Report" >> $GITHUB_STEP_SUMMARY
+          echo "## 🧹 Cleanup Report for Organization: $OWNER" >> $GITHUB_STEP_SUMMARY
           echo "| Package | Image ID | Created At | Status |" >> $GITHUB_STEP_SUMMARY
           echo "| :--- | :--- | :--- | :--- |" >> $GITHUB_STEP_SUMMARY
 
-          # Calculate cutoff timestamp
+          # Calculate cutoff
           CUTOFF_DATE=$(date -d "$DAYS days ago" +%Y-%m-%d)
           CUTOFF_TS=$(date -d "$CUTOFF_DATE" +%s)
-          
           echo "Targeting images older than: $CUTOFF_DATE"
 
-          # Iterate through provided package names
+          # 1. Fetch all container packages in the org that this token can see
+          # Note: GITHUB_TOKEN can usually only see packages linked to THIS repository.
+          echo "Fetching packages list..."
+          PACKAGES=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/orgs/$OWNER/packages?package_type=container&per_page=100" \
+            --jq '.[].name')
+
+          if [ -z "$PACKAGES" ]; then
+            echo "No packages found or accessible."
+            exit 0
+          fi
+
+          # 2. Iterate over every package found
           for PKG in $PACKAGES; do
-            echo "Processing package: $PKG..."
+            echo "Checking package: $PKG"
             
-            # Fetch versions (pagination might be needed for huge lists, fetching first 100 here)
-            # We filter for 'container' type.
+            # Fetch versions for this package
             versions=$(gh api \
               -H "Accept: application/vnd.github+json" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
-              "/orgs/$ORG/packages/container/$PKG/versions?per_page=100")
+              "/orgs/$OWNER/packages/container/$PKG/versions?per_page=100")
 
-            # Loop through versions using jq to filter
-            # Logic: Select items where metadata.container.tags is empty AND created_at < cutoff
-            
+            # Filter: Untagged AND Older than Cutoff
             echo "$versions" | jq -r --argjson cutoff "$CUTOFF_TS" '.[] | select((.metadata.container.tags | length) == 0) | select((.created_at | fromdateiso8601) < $cutoff) | "\(.id) \(.created_at)"' | \
             while read -r version_id created_at; do
               
               if [ "$DRY_RUN" = "true" ]; then
-                echo "DRY RUN: Would delete $PKG version $version_id (Created: $created_at)"
-                echo "| $PKG | $version_id | $created_at | 🟡 Dry Run (Skipped) |" >> $GITHUB_STEP_SUMMARY
+                echo "DRY RUN: Would delete $PKG : $version_id"
+                echo "| $PKG | $version_id | $created_at | 🟡 Dry Run |" >> $GITHUB_STEP_SUMMARY
               else
-                echo "DELETING: $PKG version $version_id (Created: $created_at)"
+                echo "DELETING: $PKG : $version_id"
                 
-                # Execute Delete
+                # Attempt Delete
+                set +e # Don't crash script if delete fails (e.g. permission issue)
                 gh api \
                   --method DELETE \
                   -H "Accept: application/vnd.github+json" \
                   -H "X-GitHub-Api-Version: 2022-11-28" \
-                  "/orgs/$ORG/packages/container/$PKG/versions/$version_id"
+                  "/orgs/$OWNER/packages/container/$PKG/versions/$version_id"
                 
-                if [ $? -eq 0 ]; then
+                exit_code=$?
+                set -e 
+
+                if [ $exit_code -eq 0 ]; then
                   echo "| $PKG | $version_id | $created_at | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
                 else
-                  echo "| $PKG | $version_id | $created_at | ❌ Error |" >> $GITHUB_STEP_SUMMARY
+                  echo "Error deleting. Token might lack scope for this specific package."
+                  echo "| $PKG | $version_id | $created_at | ❌ Forbidden (403) |" >> $GITHUB_STEP_SUMMARY
                 fi
               fi
             done
